@@ -1,3 +1,4 @@
+import httpx
 import os, json, time, asyncio, logging, hashlib, html, io, threading
 from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M
 from telegram.constants import ParseMode
@@ -6,6 +7,8 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ContextTypes, filters)
 
 logging.basicConfig(level=logging.INFO)
+for _n in ("httpx", "httpcore", "telegram", "tornado.access"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("jobsbot")
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -434,19 +437,33 @@ async def text_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👀 هذي المعاينة:\n\n" + text + "\n\n— — —\nأرسلها لـ " + str(len(DB["users"])) + " مستخدم؟",
             reply_markup=M([[B("✅ إرسال", callback_data="bcy"), B("❌ إلغاء", callback_data="bcn")]]), disable_web_page_preview=True); return
 
+async def ping_loop():
+    base = os.environ.get("RENDER_EXTERNAL_URL")
+    if not base: return
+    async with httpx.AsyncClient(timeout=20) as c:
+        while True:
+            await asyncio.sleep(540)
+            try: await c.get(base + "/health")
+            except Exception: pass
+
+async def on_error(update, ctx):
+    log.error("handler error: %s", ctx.error)
+
 async def post_init(app):
     if not os.path.exists(DATA_FILE):
         await restore_from_admin(app)
     else:
         load_local()
     asyncio.create_task(backup_loop(app))
+    asyncio.create_task(ping_loop())
 
 def main():
     load_local()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_error_handler(on_error)
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     port = int(os.environ.get("PORT", "10000"))
