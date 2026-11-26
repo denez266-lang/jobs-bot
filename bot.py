@@ -74,6 +74,7 @@ async def restore_from_admin(app):
                 b = await f.download_as_bytearray()
                 open(DATA_FILE, "wb").write(bytes(b))
                 load_local()
+                dirty["last_backup"] = pm.date.timestamp()
                 log.info("restored backup from admin %s", aid)
                 return True
         except TelegramError as ex:
@@ -92,19 +93,33 @@ async def do_backup(app, force=False):
         try:
             old = (await app.bot.get_chat(aid)).pinned_message
         except TelegramError: pass
-        msg = await app.bot.send_document(aid, bio, caption="🗂️ نسخة احتياطية تلقائية (لا تحذفها)", disable_notification=True)
+        msg = await app.bot.send_document(aid, bio, caption="🗂️ نسخة البيانات", disable_notification=True)
         await app.bot.pin_chat_message(aid, msg.message_id, disable_notification=True)
         if old and old.document and old.document.file_name == "jobsbot-backup.json":
             try: await app.bot.delete_message(aid, old.message_id)
             except TelegramError: pass
         dirty["v"] = False
+        dirty["last_backup"] = time.time()
     except TelegramError as ex:
         log.warning("backup failed %s", ex)
 
 async def backup_loop(app):
     while True:
-        await asyncio.sleep(120)
-        await do_backup(app)
+        await asyncio.sleep(600)
+        if dirty["v"] and time.time() - dirty["last_backup"] >= 48 * 3600:
+            await do_backup(app)
+
+async def pinned_ts(app):
+    for aid in ADMIN_IDS:
+        try:
+            pm = (await app.bot.get_chat(aid)).pinned_message
+            if pm and pm.document and pm.document.file_name == "jobsbot-backup.json":
+                dirty["last_backup"] = pm.date.timestamp(); return
+        except TelegramError: pass
+
+async def del_pin_notice(update: Update, ctx):
+    try: await update.message.delete()
+    except TelegramError: pass
 
 # ---------- user side ----------
 def jobs_kb():
@@ -358,7 +373,7 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚙️ <b>لوحة الأدمن</b>", parse_mode=H, reply_markup=adm_kb()); return
     if d == "a:backup":
         await do_backup(ctx.application, force=True)
-        await q.message.reply_text("✅ انرسلت النسخة الاحتياطية وتثبتت بالمحادثة."); return
+        await q.message.reply_text("✅ تم حفظ النسخة."); return
     if d == "a:bc":
         ctx.user_data["state"] = {"t": "bc"}
         await q.edit_message_text(f"📣 اكتب الرسالة اللي تبي ترسلها لكل المستخدمين ({len(DB['users'])} مستخدم). راح أعرضها لك للتأكيد قبل الإرسال.",
@@ -454,6 +469,7 @@ async def post_init(app):
         await restore_from_admin(app)
     else:
         load_local()
+        await pinned_ts(app)
     asyncio.create_task(backup_loop(app))
     asyncio.create_task(ping_loop())
 
@@ -464,6 +480,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("myid", myid))
     app.add_error_handler(on_error)
+    app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, del_pin_notice))
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     port = int(os.environ.get("PORT", "10000"))
