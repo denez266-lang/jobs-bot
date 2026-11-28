@@ -279,6 +279,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛠️ البوت تحت الصيانة حالياً، ارجع بعد شوي."); return
     arg = ctx.args[0] if ctx.args else ""
     cc = CUR.get()
+    if arg == "country":
+        ctx.user_data["pend"] = ""
+        await ask_country(update.message); return
     if not cc_known(cc) and not ctx.user_data.get("cc_manual_skip"):
         ctx.user_data["pend"] = arg
         await ask_country(update.message); return
@@ -297,6 +300,7 @@ def adm_kb():
         [B("➕ إضافة وظيفة", callback_data="a:add"), B("📋 الوظائف", callback_data="a:list")],
         [B("📊 الإحصائيات", callback_data="a:stats"), B("📣 إرسال للجميع", callback_data="a:bc")],
         [B("👋 رسالة الترحيب", callback_data="a:welcome"), B("📝 نص أسفل الوظيفة", callback_data="a:footer")],
+        [B("💼 وضع السكرتير (حساب شخصي): " + ("مفعّل ✅" if DB["settings"].get("biz_on", True) else "مطفي ❌"), callback_data="a:biz")],
         [B("🛠️ وضع الصيانة: " + ("مفعّل ✅" if DB["settings"].get("maintenance") else "مطفي ❌"), callback_data="a:maint")],
         [B("📢 ربط القناة: " + (DB["settings"].get("channel") or "غير محدد"), callback_data="a:chan")],
         [B("🧠 الذكاء الاصطناعي (أجوبة تلقائية)", callback_data="ai:m")],
@@ -362,6 +366,10 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = q.data
     await q.answer()
     bind(q.from_user)
+    if d.startswith("bz:"):
+        conn = getattr(q.message, "business_connection_id", None) or BIZ_LAST.get(uid)
+        if not conn: return
+        q = BizQuery(q, conn, d[3:]); d = q.data
     if d == "pickcc":
         await q.message.reply_text("🌍 اختر بلدك:", reply_markup=pick_kb()); return
     if d.startswith("cc:"):
@@ -496,6 +504,9 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["state"] = {"t": "setting", "k": "footer"}
         await q.edit_message_text("📝 نص يظهر أسفل كل وظيفة (الحالي: " + (e(DB["settings"]["footer"]) or "فارغ") + ")\nاكتب النص الجديد، أو اكتب - لمسحه:", parse_mode=H,
                                   reply_markup=M([[B("❌ إلغاء", callback_data="a:menu")]])); return
+    if d == "a:biz":
+        DB["settings"]["biz_on"] = not DB["settings"].get("biz_on", True); save()
+        await q.edit_message_text("⚙️ <b>لوحة الأدمن</b>", parse_mode=H, reply_markup=adm_kb()); return
     if d == "a:maint":
         DB["settings"]["maintenance"] = not DB["settings"].get("maintenance"); save()
         await q.edit_message_text("⚙️ <b>لوحة الأدمن</b>", parse_mode=H, reply_markup=adm_kb()); return
@@ -803,6 +814,8 @@ def contact_kb():
                                resize_keyboard=True, one_time_keyboard=True)
 
 async def ask_country(msg):
+    if msg.__class__.__name__ == "BizMsg":
+        await ask_country_biz(msg); return
     await msg.reply_text("🌍 لنعرض لك الوظائف المناسبة لبلدك، اضغط الزر لمشاركة رقمك.\n"
                          "🔒 نستخدم رمز الدولة فقط لنعرف بلدك، والرقم نفسه ما ينحفظ ولا ينرسل لأي جهة.\n"
                          "او اختر بلدك يدوياً.", reply_markup=contact_kb())
@@ -1197,6 +1210,121 @@ async def ai_text(update, ctx, st, text):
         await update.message.reply_text(res + "\n\nجرب سؤال ثاني او ارجع.", parse_mode=H, reply_markup=M([[B("🔙 خروج", callback_data="ai:m")]])); return
 
 
+# ---------- Telegram Business (Secretary mode): same bot logic inside the owner's personal chats ----------
+import types
+from telegram import InlineKeyboardMarkup
+from telegram.ext import BusinessConnectionHandler
+
+BIZ_SENT = set()        # (chat_id, message_id) of messages the bot sent through a business connection
+BIZ_LASTSEND = {}       # chat_id -> time of the bot's last business send (to ignore echoes)
+BIZ_MUTE = {}           # chat_id -> time the owner last wrote manually there
+BIZ_LAST = {}           # customer user id -> last business connection id seen
+BIZ_MUTE_SECS = 6 * 3600
+
+def _biz_markup(rm):
+    if isinstance(rm, InlineKeyboardMarkup):
+        rows = []
+        for r in rm.inline_keyboard:
+            rows.append([B(b.text, callback_data=("bz:" + b.callback_data)[:64]) if b.callback_data else b for b in r])
+        return M(rows)
+    return None   # reply keyboards are not used inside business chats
+
+class BizBot:
+    def __init__(self, bot, conn): self._b = bot; self._c = conn
+    def __getattr__(self, name):
+        f = getattr(self._b, name)
+        if not name.startswith("send_"): return f
+        async def w(*a, **k):
+            k["business_connection_id"] = self._c
+            if "reply_markup" in k: k["reply_markup"] = _biz_markup(k["reply_markup"])
+            r = await f(*a, **k)
+            cid = a[0] if a else k.get("chat_id")
+            BIZ_LASTSEND[cid] = time.time()
+            mid = getattr(r, "message_id", None)
+            if mid:
+                if len(BIZ_SENT) > 2000: BIZ_SENT.clear()
+                BIZ_SENT.add((cid, mid))
+            return r
+        return w
+
+class BizMsg:
+    def __init__(self, m, conn):
+        self.m = m; self.conn = conn
+        self.chat_id = m.chat.id; self.text = getattr(m, "text", None); self.contact = None
+        self.from_user = getattr(m, "from_user", None); self.message_id = m.message_id
+    def get_bot(self): return BizBot(self.m.get_bot(), self.conn)
+    async def reply_text(self, text, **k): return await self.get_bot().send_message(self.chat_id, text, **k)
+    async def edit_text(self, text, **k): return await self.reply_text(text, **k)
+    async def delete(self): return None
+
+class BizQuery:
+    def __init__(self, q, conn, data):
+        self._q = q; self.data = data; self.from_user = q.from_user
+        self.message = BizMsg(q.message, conn); self._conn = conn
+    async def answer(self, *a, **k): return None
+    async def edit_message_text(self, text, **k): return await self.message.reply_text(text, **k)
+    def get_bot(self): return self.message.get_bot()
+
+async def biz_owner(bot, conn):
+    b = DB.setdefault("biz", {}).setdefault("conns", {})
+    c = b.get(conn)
+    if c: return c.get("uid")
+    try:
+        bc = await bot.get_business_connection(conn)
+        b[conn] = {"uid": bc.user.id, "chat": bc.user_chat_id, "en": bc.is_enabled}; save()
+        return bc.user.id
+    except TelegramError as ex:
+        log.warning("business connection lookup failed %s", ex)
+        return None
+
+async def biz_conn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bc = update.business_connection
+    if not bc: return
+    DB.setdefault("biz", {}).setdefault("conns", {})[bc.id] = {"uid": bc.user.id, "chat": bc.user_chat_id, "en": bc.is_enabled}
+    save()
+    log.info("business connection %s enabled=%s", bc.id[:6], bc.is_enabled)
+    if bc.user.id in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(bc.user_chat_id, "✅ تم ربط وضع السكرتير بحسابك." if bc.is_enabled else "⏸️ تم فصل وضع السكرتير.")
+        except TelegramError: pass
+
+async def ask_country_biz(msg):
+    un = msg.m.get_bot().username
+    await msg.reply_text("🌍 اختر بلدك حتى أعرض لك الوظائف المناسبة:\n(او تكدر تشارك رقمك من البوت: https://t.me/" + str(un) + "?start=country )",
+                         reply_markup=pick_kb(), disable_web_page_preview=True)
+
+async def biz_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.business_message
+    if not m or not m.from_user or m.chat.type != "private": return
+    if not DB["settings"].get("biz_on", True): return
+    conn = m.business_connection_id
+    now = time.time()
+    owner = await biz_owner(ctx.bot, conn)
+    if owner is None or m.from_user.is_bot: return
+    if m.from_user.id == owner:
+        # the owner wrote in this chat: ignore the bot's own echoes, otherwise pause the auto-reply here
+        if (m.chat.id, m.message_id) in BIZ_SENT or now - BIZ_LASTSEND.get(m.chat.id, 0) < 8: return
+        BIZ_MUTE[m.chat.id] = now; return
+    if now - BIZ_MUTE.get(m.chat.id, 0) < BIZ_MUTE_SECS: return
+    text = (m.text or "").strip()
+    if not text: return
+    u = m.from_user
+    track_user(u); bind(u)
+    BIZ_LAST[u.id] = conn
+    bm = BizMsg(m, conn)
+    fu = types.SimpleNamespace(effective_user=u, effective_chat=types.SimpleNamespace(id=m.chat.id, type="private"), message=bm)
+    if DB["settings"].get("maintenance"): return
+    if text.startswith("/start"):
+        ctx.args = text.split()[1:]
+        await start(fu, ctx); return
+    if text.startswith("/country"):
+        await ask_country_biz(bm); return
+    if text.startswith("/"): return
+    if not cc_known(CUR.get()):
+        ctx.user_data["pend"] = ""
+        await ask_country_biz(bm); return
+    await text_msg(fu, ctx)
+
 async def ping_loop():
     base = os.environ.get("RENDER_EXTERNAL_URL")
     if not base: return
@@ -1232,13 +1360,15 @@ def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("gkeys", gkeys_cmd))
     app.add_handler(CommandHandler("country", country_cmd))
-    app.add_handler(MessageHandler(filters.CONTACT, contact_msg))
+    app.add_handler(BusinessConnectionHandler(biz_conn))
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, biz_msg))
+    app.add_handler(MessageHandler(filters.CONTACT & filters.UpdateType.MESSAGE, contact_msg))
     app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, del_pin_notice))
     app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
-                                   | filters.ANIMATION | filters.Document.ALL, media_msg))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, text_msg))
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO | filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+                                   | filters.ANIMATION | filters.Document.ALL) & filters.UpdateType.MESSAGE, media_msg))
     port = int(os.environ.get("PORT", "10000"))
     base = os.environ.get("RENDER_EXTERNAL_URL")
     if base:
