@@ -196,6 +196,7 @@ async def show_replies_admin(q, jid, ci):
 # ---------- user side ----------
 def jobs_kb():
     rows = [[B(f"💼 {j['title']}", callback_data=f"job:{jid}")] for jid, j in DB["jobs"].items() if j.get("active", True) and job_visible(j)]
+    if rows and cc_known(CUR.get()) and active_countries(): rows.append([B("🌍 تغيير الدولة", callback_data="pcl")])
     return M(rows) if rows else None
 
 def contact_url(c):
@@ -280,11 +281,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     arg = ctx.args[0] if ctx.args else ""
     cc = CUR.get()
     if arg == "country":
-        ctx.user_data["pend"] = ""
-        await ask_country(update.message); return
-    if not cc_known(cc) and not ctx.user_data.get("cc_manual_skip"):
-        ctx.user_data["pend"] = arg
-        await ask_country(update.message); return
+        await show_entry(update.message); return
     if arg.isdigit():
         ctx.user_data["cj"] = arg
         await send_job(update.message, arg)
@@ -380,7 +377,19 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError: pass
         await q.get_bot().send_message(q.message.chat_id, f"✅ تم: بلدك {CUR.get()['n']}\nلتغييره: /country", reply_markup=ReplyKeyboardRemove())
         await after_country(q.message, ctx, q.from_user); return
+    if d == "pcl":
+        await q.edit_message_text(countries_txt(), parse_mode=H, reply_markup=countries_kb()); return
+    if d.startswith("pc:"):
+        hit = [(k, n) for k, n in active_countries().items() if _cid(k) == d[3:]]
+        if not hit:
+            await q.edit_message_text(countries_txt(), parse_mode=H, reply_markup=countries_kb()); return
+        track_user(q.from_user)
+        set_cc(q.from_user, {"k": hit[0][0], "n": hit[0][1], "src": "pick"})
+        kb = jobs_kb()
+        await q.edit_message_text(f"✅ وظائف <b>{e(hit[0][1])}</b>:\nاضغط على الوظيفة لعرض تفاصيلها 👇" if kb else nojobs_txt(), parse_mode=H, reply_markup=kb); return
     if d == "list":
+        if need_countries():
+            await q.edit_message_text(countries_txt(), parse_mode=H, reply_markup=countries_kb()); return
         kb = jobs_kb()
         await q.edit_message_text("📂 <b>الوظائف المتوفرة:</b>" if kb else nojobs_txt(), parse_mode=H, reply_markup=kb); return
     if d.startswith("job:"):
@@ -554,8 +563,6 @@ async def broadcast(app, admin_chat, text):
 async def text_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     track_user(u); bind(u)
-    if update.effective_chat.type == "private" and (update.message.text or "").strip() == "🌍 اختيار البلد يدوياً":
-        await update.message.reply_text("🌍 اختر بلدك:", reply_markup=pick_kb()); return
     st = ctx.user_data.get("state")
     if not st or not is_admin(u.id):
         if DB["settings"].get("maintenance") and not is_admin(u.id):
@@ -774,6 +781,7 @@ def cc_match(cname, cc):
     if not cc_known(cc): return True
     n = norm(cname)
     if any(w in n for w in _ALLW): return True
+    if cc.get("k"): return n == cc["k"]
     al = DIAL.get(cc.get("d"), (None, []))[1]
     return any(norm(a) in n for a in al)
 
@@ -801,7 +809,7 @@ def dial_of(phone):
 def mismatch_txt(j):
     cc = CUR.get()
     names = "، ".join(c.get("name", "") for c in j.get("countries", [])) or "دول ثانية"
-    return f"🚫 هذي الوظيفة مخصصة لـ {e(names)}، وانت من {e(cc.get('n', 'بلد ثاني'))}.\nاختر من الوظائف المتاحة لبلدك 👇"
+    return f"🚫 هذي الوظيفة مخصصة لـ {e(names)}، وانت مختار دولة {e(cc.get('n', 'ثانية'))}.\nاختر من الوظائف المتاحة لدولتك، او غيّر الدولة 👇"
 
 def nojobs_txt():
     cc = CUR.get()
@@ -814,11 +822,10 @@ def contact_kb():
                                resize_keyboard=True, one_time_keyboard=True)
 
 async def ask_country(msg):
-    if msg.__class__.__name__ == "BizMsg":
-        await ask_country_biz(msg); return
-    await msg.reply_text("🌍 لنعرض لك الوظائف المناسبة لبلدك، اضغط الزر لمشاركة رقمك.\n"
-                         "🔒 نستخدم رمز الدولة فقط لنعرف بلدك، والرقم نفسه ما ينحفظ ولا ينرسل لأي جهة.\n"
-                         "او اختر بلدك يدوياً.", reply_markup=contact_kb())
+    cs = active_countries()
+    if not cs:
+        await show_entry(msg); return
+    await msg.reply_text(countries_txt(), parse_mode=H, reply_markup=countries_kb())
 
 def pick_kb():
     rows, row = [], []
@@ -830,10 +837,15 @@ def pick_kb():
     return M(rows)
 
 async def home(msg, u):
-    kb = jobs_kb()
-    txt = e(DB["settings"]["welcome"])
-    if not kb: txt += "\n\n" + nojobs_txt()
-    rows = list(kb.inline_keyboard) if kb else []
+    welcome = e(DB["settings"]["welcome"])
+    rec = DB["users"].get(str(u.id))
+    if rec is not None and not rec.get("seen"): rec["seen"] = 1; save()
+    if need_countries():
+        txt = welcome + "\n\n" + countries_txt(); rows = list(countries_kb().inline_keyboard)
+    else:
+        kb = jobs_kb()
+        txt = welcome + ("" if kb else "\n\n" + nojobs_txt())
+        rows = list(kb.inline_keyboard) if kb else []
     if is_admin(u.id): rows.append([B("⚙️ لوحة الأدمن", callback_data="adm")])
     await msg.reply_text(txt, parse_mode=H, reply_markup=M(rows) if rows else None)
 
@@ -862,6 +874,45 @@ async def contact_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def country_cmd(update: Update, ctx):
     track_user(update.effective_user)
     await ask_country(update.message)
+
+# ---------- country buttons built from the countries that currently have jobs ----------
+import hashlib as _hl
+
+def active_countries():
+    out = {}
+    for j in DB["jobs"].values():
+        if not j.get("active", True): continue
+        for c in j.get("countries", []):
+            n = (c.get("name") or "").strip(); k = norm(n)
+            if not k or any(w in k for w in _ALLW): continue
+            out.setdefault(k, n)
+    return out
+
+def _cid(k): return _hl.md5(k.encode()).hexdigest()[:8]
+
+def countries_kb():
+    rows = [[B("🌍 وظائف " + n, callback_data="pc:" + _cid(k))] for k, n in active_countries().items()]
+    return M(rows)
+
+def countries_txt():
+    cs = active_countries()
+    if len(cs) == 1:
+        return "🌍 الوظائف المتوفرة حالياً لدولة: <b>" + e(list(cs.values())[0]) + "</b> فقط.\nاضغط على دولتك 👇"
+    return "🌍 اختر دولتك لتشوف وظائفها 👇"
+
+def need_countries():
+    return (not cc_known(CUR.get())) and bool(active_countries())
+
+def entry_kb():
+    return countries_kb() if need_countries() else jobs_kb()
+
+async def show_entry(msg, head=None):
+    """first reply: country buttons (when country not chosen yet), else the jobs list"""
+    if need_countries():
+        await msg.reply_text(((head + "\n\n") if head else "") + countries_txt(), parse_mode=H, reply_markup=countries_kb()); return
+    kb = jobs_kb()
+    await msg.reply_text(((head + "\n\n") if head else "") + ("📂 <b>الوظائف المتوفرة حالياً:</b>\nاضغط على الوظيفة لعرض تفاصيلها 👇" if kb else nojobs_txt()),
+                         parse_mode=H, reply_markup=kb)
 
 # ---------- conversational layer (AI picks an action; texts of jobs/answers always come from stored data) ----------
 _GREET = ["هلا", "هلو", "مرحبا", "مرحبتين", "اهلا", "سلام", "السلام عليكم", "صباح الخير", "مساء الخير", "هاي", "hi", "hello", "hey",
@@ -967,19 +1018,15 @@ async def run_action(update, ctx, act, arg):
             if len(j.get("countries", [])) == 1:
                 return await run_action(update, ctx, "country", (jid, 0))
             return await run_action(update, ctx, "job", jid)
-        kb = jobs_kb()
-        await update.message.reply_text("اختر الوظيفة من القائمة لتشوف الراتب والتفاصيل 👇" if kb else nojobs_txt(),
-                                        reply_markup=kb); return True
+        await show_entry(update.message, "اختر لتشوف الراتب والتفاصيل 👇"); return True
     if act == "jobs":
-        kb = jobs_kb()
-        await update.message.reply_text("📂 <b>الوظائف المتوفرة حالياً:</b>\nاضغط على الوظيفة لعرض تفاصيلها 👇" if kb else nojobs_txt(),
-                                        parse_mode=H, reply_markup=kb); return True
+        await show_entry(update.message); return True
     if act == "greet":
-        await update.message.reply_text("هلا وغلا 🌹\n" + e(DB["settings"]["welcome"]), parse_mode=H, reply_markup=jobs_kb()); return True
+        await home(update.message, update.effective_user); return True
     if act == "thanks":
-        await update.message.reply_text("العفو 🌹 اذا تحتاج شي ثاني اني حاضر.", reply_markup=jobs_kb()); return True
+        await update.message.reply_text("العفو 🌹 اذا تحتاج شي ثاني اني حاضر.", reply_markup=entry_kb()); return True
     if act == "chat":
-        await update.message.reply_text(e(arg), parse_mode=H, reply_markup=jobs_kb()); return True
+        await update.message.reply_text(e(arg), parse_mode=H, reply_markup=entry_kb()); return True
     return False
 
 async def answer_question(update, ctx, text):
@@ -1019,7 +1066,7 @@ async def answer_question(update, ctx, text):
     u = update.effective_user
     a["un"].append({"q": (text or "")[:200], "t": int(now), "u": (u.first_name or "") + (" @" + u.username if u.username else "")})
     del a["un"][:-40]; save()
-    await update.message.reply_text(a["fallback"], reply_markup=jobs_kb())
+    await update.message.reply_text(a["fallback"], reply_markup=entry_kb())
 
 # ---------- one-time page for entering engine keys (admin only) ----------
 def keys_link():
@@ -1318,11 +1365,11 @@ async def biz_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.args = text.split()[1:]
         await start(fu, ctx); return
     if text.startswith("/country"):
-        await ask_country_biz(bm); return
+        await ask_country(bm); return
     if text.startswith("/"): return
-    if not cc_known(CUR.get()):
-        ctx.user_data["pend"] = ""
-        await ask_country_biz(bm); return
+    rec = DB["users"].get(str(u.id))
+    if rec is not None and not rec.get("seen"):
+        await home(bm, u); return     # first contact: welcome + country buttons
     await text_msg(fu, ctx)
 
 async def ping_loop():
