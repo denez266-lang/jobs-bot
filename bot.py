@@ -725,6 +725,8 @@ _GREET = ["هلا", "هلو", "مرحبا", "مرحبتين", "اهلا", "سل�
 _THANKS = ["شكرا", "تسلم", "مشكور", "يعطيك العافيه", "يعطيكم العافيه", "يسلمو", "ممنون", "الله يعافيك"]
 _JOBW = ["وظيف", "شغل", "عمل", "دوام", "ناشر", "متوف", "تقديم", "اقدم", "فرص", "شاغر", "توظيف", "اشتغل", "job", "work", "vacanc"]
 
+_DETAIL = ["راتب", "الراتب", "معاش", "اجر", "اجور", "عمول", "ساعات", "دوام", "شروط", "مده", "متطلبات", "تفاصيل", "كيف اقدم", "كيف التقديم", "شكد", "بكم", "تعويض", "مكافا"]
+
 def _has(nq, words):
     return any((" " + norm(w) + " ") in nq if len(norm(w)) <= 3 else norm(w) in nq for w in words)
 
@@ -743,6 +745,7 @@ def rule_intent(text, jid=None):
     for i, j in ordered:
         t = norm(j.get("title", ""))
         if len(t) >= 4 and t in nq: return "job", i
+    if _has(nq, _DETAIL): return "detail", None
     if _has(nq, _JOBW): return "jobs", None
     words = len(nq.split())
     if words <= 6 and _has(nq, _THANKS): return "thanks", None
@@ -809,6 +812,18 @@ async def run_action(update, ctx, act, arg):
             await update.message.reply_text(country_text(j, j["countries"][ci]), parse_mode=H, reply_markup=country_kb(jid, j), disable_web_page_preview=True)
             ctx.user_data["rj"] = None
             await send_replies(bot, cid, j["countries"][ci].get("replies")); return True
+    if act == "detail":
+        act_jobs = [i for i, j in DB["jobs"].items() if j.get("active", True)]
+        cj = str(ctx.user_data.get("cj") or "")
+        jid = cj if cj in act_jobs else (act_jobs[0] if len(act_jobs) == 1 else None)
+        if jid:
+            j = DB["jobs"][jid]
+            if len(j.get("countries", [])) == 1:
+                return await run_action(update, ctx, "country", (jid, 0))
+            return await run_action(update, ctx, "job", jid)
+        kb = jobs_kb()
+        await update.message.reply_text("اختر الوظيفة من القائمة لتشوف الراتب والتفاصيل 👇" if kb else "🕐 ما مضافة وظائف حالياً، تابع القناة للجديد 📢",
+                                        reply_markup=kb); return True
     if act == "jobs":
         kb = jobs_kb()
         await update.message.reply_text("📂 <b>الوظائف المتوفرة حالياً:</b>\nاضغط على الوظيفة لعرض تفاصيلها 👇" if kb else "🕐 ما مضافة وظائف حالياً، تابع القناة للجديد 📢",
