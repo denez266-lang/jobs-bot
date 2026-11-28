@@ -121,6 +121,69 @@ async def del_pin_notice(update: Update, ctx):
     try: await update.message.delete()
     except TelegramError: pass
 
+# ---------- custom replies (per job / per country) ----------
+KIND_LBL = {"text": "📝 نص", "voice": "🎤 صوتية", "audio": "🎵 صوت", "photo": "🖼️ صورة", "video": "🎬 فيديو",
+            "document": "📎 ملف", "video_note": "⭕ فيديو دائري", "animation": "🎞️ GIF"}
+
+def rep_list(jid, ci, create=False):
+    j = DB["jobs"].get(jid)
+    if not j: return None
+    if ci == "-": tgt = j
+    else:
+        try: tgt = j["countries"][int(ci)]
+        except (IndexError, ValueError, KeyError): return None
+    if create: return tgt.setdefault("replies", [])
+    return tgt.get("replies", [])
+
+def msg_to_reply(m):
+    cap = m.caption_html if hasattr(m, "caption_html") else None
+    if m.text: return {"k": "text", "v": m.text_html}
+    if m.voice: return {"k": "voice", "v": m.voice.file_id, "cap": cap}
+    if m.audio: return {"k": "audio", "v": m.audio.file_id, "cap": cap}
+    if m.video_note: return {"k": "video_note", "v": m.video_note.file_id}
+    if m.animation: return {"k": "animation", "v": m.animation.file_id, "cap": cap}
+    if m.photo: return {"k": "photo", "v": m.photo[-1].file_id, "cap": cap}
+    if m.video: return {"k": "video", "v": m.video.file_id, "cap": cap}
+    if m.document: return {"k": "document", "v": m.document.file_id, "cap": cap}
+    return None
+
+async def send_replies(bot, chat_id, items):
+    for r in items or []:
+        k, v, cap = r.get("k"), r.get("v"), r.get("cap")
+        try:
+            if k == "text": await bot.send_message(chat_id, v, parse_mode=H, disable_web_page_preview=True)
+            elif k == "voice": await bot.send_voice(chat_id, v, caption=cap, parse_mode=H)
+            elif k == "audio": await bot.send_audio(chat_id, v, caption=cap, parse_mode=H)
+            elif k == "video_note": await bot.send_video_note(chat_id, v)
+            elif k == "animation": await bot.send_animation(chat_id, v, caption=cap, parse_mode=H)
+            elif k == "photo": await bot.send_photo(chat_id, v, caption=cap, parse_mode=H)
+            elif k == "video": await bot.send_video(chat_id, v, caption=cap, parse_mode=H)
+            elif k == "document": await bot.send_document(chat_id, v, caption=cap, parse_mode=H)
+        except TelegramError as ex:
+            log.warning("reply send failed %s", ex)
+        await asyncio.sleep(0.4)
+
+async def show_replies_admin(q, jid, ci):
+    items = rep_list(jid, ci)
+    if items is None:
+        await q.edit_message_text("❌ غير موجودة.", reply_markup=M([[B("🔙", callback_data="a:list")]])); return
+    j = DB["jobs"][jid]
+    where = j["title"] if ci == "-" else f"{j['title']} / {j['countries'][int(ci)]['name']}"
+    lines = [f"💬 ردود: {e(where)}", "تنرسل تلقائياً بهذا الترتيب لما المتقدم يفتح " + ("الوظيفة." if ci == "-" else "هذي الدولة."), ""]
+    rows = []
+    for n, r in enumerate(items):
+        prev = e((r.get("v") if r["k"] == "text" else (r.get("cap") or ""))[:40])
+        lines.append(f"{n+1}. {KIND_LBL.get(r['k'], r['k'])} {prev}")
+        row = [B(f"🗑️ {n+1}", callback_data=f"rpd:{jid}:{ci}:{n}")]
+        if n > 0: row.append(B(f"⬆️ {n+1}", callback_data=f"rpu:{jid}:{ci}:{n}"))
+        rows.append(row)
+    if not items: lines.append("ماكو ردود بعد.")
+    rows.insert(0, [B("➕ إضافة رد", callback_data=f"rpa:{jid}:{ci}")])
+    if items: rows.insert(1, [B("👁️ معاينة", callback_data=f"rpv:{jid}:{ci}")])
+    back = f"a:j:{jid}" if ci == "-" else f"ac:{jid}:{ci}"
+    rows.append([B("🔙", callback_data=back)])
+    await q.edit_message_text("\n".join(lines), parse_mode=H, reply_markup=M(rows))
+
 # ---------- user side ----------
 def jobs_kb():
     rows = [[B(f"💼 {j['title']}", callback_data=f"job:{jid}")] for jid, j in DB["jobs"].items() if j.get("active", True)]
@@ -177,7 +240,7 @@ def track_user(u):
         rec["last"] = now
     save()
 
-async def send_job(msg_target, jid, edit=False):
+async def send_job(msg_target, jid, edit=False, ctx=None):
     j = DB["jobs"].get(str(jid))
     if not j or not j.get("active", True):
         txt, kb = "😕 هذه الوظيفة غير متوفرة حالياً.", jobs_kb()
@@ -189,6 +252,13 @@ async def send_job(msg_target, jid, edit=False):
         except TelegramError: pass
     await msg_target.reply_text(txt, parse_mode=H, reply_markup=kb, disable_web_page_preview=True)
 
+async def job_replies(msg_target, jid, ctx, force=False):
+    j = DB["jobs"].get(str(jid))
+    if not j or not j.get("active", True) or not j.get("replies"): return
+    if not force and ctx.user_data.get("rj") == str(jid): return
+    ctx.user_data["rj"] = str(jid)
+    await send_replies(msg_target.get_bot(), msg_target.chat_id, j["replies"])
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     track_user(u)
@@ -197,7 +267,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛠️ البوت تحت الصيانة حالياً، ارجع بعد شوي."); return
     arg = ctx.args[0] if ctx.args else ""
     if arg.isdigit():
-        await send_job(update.message, arg); return
+        await send_job(update.message, arg)
+        await job_replies(update.message, arg, ctx, force=True); return
     kb = jobs_kb()
     txt = e(DB["settings"]["welcome"])
     if not kb: txt += "\n\n🕐 ما مضافة وظائف حالياً، تابع القناة."
@@ -236,6 +307,7 @@ async def show_job_admin(q, jid):
            f"\n\n🔗 <code>{link}</code>\n👁️ المشاهدات: {DB['views'].get(jid,0)}  {'🟢 ظاهرة' if j.get('active', True) else '🔴 مخفية'}")
     rows = [[B(f"🌍 {c['name']}", callback_data=f"ac:{jid}:{i}")] for i, c in enumerate(j.get("countries", []))]
     rows.append([B("➕ إضافة دولة", callback_data=f"nc:{jid}")])
+    rows.append([B(f"💬 ردود الوظيفة ({len(j.get('replies', []))})", callback_data=f"rp:{jid}:-")])
     rows.append([B("📢 نشر بالقناة", callback_data=f"pub:{jid}")])
     rows.append([B("✏️ العنوان", callback_data=f"e:{jid}:title"), B("✏️ الساعات", callback_data=f"e:{jid}:hours"), B("✏️ التواصل", callback_data=f"e:{jid}:contact")])
     rows.append([B("🙈 إخفاء" if j.get("active", True) else "👁️ إظهار", callback_data=f"t:{jid}"), B("🗑️ حذف", callback_data=f"d:{jid}")])
@@ -248,6 +320,7 @@ async def show_country_admin(q, jid, i):
         await q.edit_message_text("❌ غير موجودة.", reply_markup=M([[B("🔙", callback_data=f"a:j:{jid}")]])); return
     c = j["countries"][i]
     rows = [[B(f"✏️ {lbl}", callback_data=f"ec:{jid}:{i}:{k}")] for k, lbl in CFIELDS]
+    rows.append([B(f"💬 ردود الدولة ({len(c.get('replies', []))})", callback_data=f"rp:{jid}:{i}")])
     rows.append([B("🗑️ حذف الدولة", callback_data=f"dc:{jid}:{i}")])
     rows.append([B("🔙", callback_data=f"a:j:{jid}")])
     await q.edit_message_text(country_text(j, c), parse_mode=H, reply_markup=M(rows))
@@ -280,13 +353,16 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = jobs_kb()
         await q.edit_message_text("📂 <b>الوظائف المتوفرة:</b>" if kb else "🕐 ما مضافة وظائف حالياً.", parse_mode=H, reply_markup=kb); return
     if d.startswith("job:"):
-        await send_job(q.message, d[4:], edit=True); return
+        await send_job(q.message, d[4:], edit=True)
+        await job_replies(q.message, d[4:], ctx); return
     if d.startswith("c:"):
         _, jid, i = d.split(":")
         j = DB["jobs"].get(jid)
         if not j or not j.get("active", True) or int(i) >= len(j.get("countries", [])):
             await q.edit_message_text("😕 غير متوفرة.", reply_markup=jobs_kb()); return
-        await q.edit_message_text(country_text(j, j["countries"][int(i)]), parse_mode=H, reply_markup=country_kb(jid, j)); return
+        await q.edit_message_text(country_text(j, j["countries"][int(i)]), parse_mode=H, reply_markup=country_kb(jid, j))
+        ctx.user_data["rj"] = None
+        await send_replies(q.get_bot(), q.message.chat_id, j["countries"][int(i)].get("replies")); return
     if not is_admin(uid): return
     if d == "adm":
         await q.message.reply_text("⚙️ <b>لوحة الأدمن</b>", parse_mode=H, reply_markup=adm_kb()); return
@@ -303,6 +379,30 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📋 <b>الوظائف</b>" if DB["jobs"] else "ما مضافة وظائف بعد.", parse_mode=H, reply_markup=M(rows)); return
     if d.startswith("a:j:"):
         await show_job_admin(q, d[4:]); return
+    if d.startswith("rp:"):
+        _, jid, ci = d.split(":"); ctx.user_data.pop("state", None)
+        await show_replies_admin(q, jid, ci); return
+    if d.startswith("rpa:"):
+        _, jid, ci = d.split(":")
+        if rep_list(jid, ci) is None: return
+        ctx.user_data["state"] = {"t": "rep", "jid": jid, "ci": ci, "n": 0}
+        await q.edit_message_text("➕ ارسل الرد هسه: نص، تسجيل صوتي، صورة، فيديو او ملف.\nتكدر ترسل عدة رسائل ورا بعض، كل وحدة ترد جديد بالترتيب.\nلما تخلص اضغط ✅ تم.",
+            reply_markup=M([[B("✅ تم", callback_data=f"rpe:{jid}:{ci}")]])); return
+    if d.startswith("rpe:"):
+        _, jid, ci = d.split(":"); st = ctx.user_data.pop("state", None)
+        if st and st.get("n"): await do_backup(ctx.application, force=True)
+        await show_replies_admin(q, jid, ci); return
+    if d.startswith("rpd:") or d.startswith("rpu:"):
+        act, jid, ci, n = d.split(":"); n = int(n)
+        items = rep_list(jid, ci)
+        if items is not None and 0 <= n < len(items):
+            if act == "rpd": items.pop(n)
+            elif n > 0: items[n-1], items[n] = items[n], items[n-1]
+            save()
+        await show_replies_admin(q, jid, ci); return
+    if d.startswith("rpv:"):
+        _, jid, ci = d.split(":")
+        await send_replies(q.get_bot(), q.message.chat_id, rep_list(jid, ci)); return
     if d.startswith("ac:"):
         _, jid, i = d.split(":"); await show_country_admin(q, jid, int(i)); return
     if d.startswith("nc:"):
@@ -387,6 +487,21 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("bc_text", None)
         await q.edit_message_text("تم الإلغاء.", reply_markup=M([[B("🔙", callback_data="a:menu")]])); return
 
+async def rep_add(update, ctx, st):
+    items = rep_list(st["jid"], st["ci"], create=True)
+    r = msg_to_reply(update.message)
+    if items is None or not r:
+        await update.message.reply_text("❌ هذا النوع غير مدعوم."); return
+    items.append(r); st["n"] += 1; save()
+    await update.message.reply_text(f"✅ انضاف رد رقم {len(items)} ({KIND_LBL.get(r['k'], r['k'])}). ارسل التالي او اضغط تم.",
+        reply_markup=M([[B("✅ تم", callback_data=f"rpe:{st['jid']}:{st['ci']}")]]))
+
+async def media_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    st = ctx.user_data.get("state")
+    if st and st.get("t") == "rep" and is_admin(u.id):
+        await rep_add(update, ctx, st)
+
 async def broadcast(app, admin_chat, text):
     ok = fail = 0
     for uid in list(DB["users"].keys()):
@@ -407,6 +522,8 @@ async def text_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = jobs_kb()
         await update.message.reply_text("اختر وظيفة من القائمة 👇" if kb else "تابع القناة للوظائف الجديدة 📢", reply_markup=kb); return
     text = update.message.text
+    if st["t"] == "rep":
+        await rep_add(update, ctx, st); return
     if st["t"] == "add":
         key = FIELDS[st["step"]][0]
         st["job"][key] = text.strip()
@@ -483,6 +600,8 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, del_pin_notice))
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+                                   | filters.ANIMATION | filters.Document.ALL, media_msg))
     port = int(os.environ.get("PORT", "10000"))
     base = os.environ.get("RENDER_EXTERNAL_URL")
     if base:
