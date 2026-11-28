@@ -1029,6 +1029,46 @@ async def run_action(update, ctx, act, arg):
         await update.message.reply_text(e(arg), parse_mode=H, reply_markup=entry_kb()); return True
     return False
 
+_FLD = [
+ ("payout", ["استلام", "استلم", "يستلم", "طريقه الراتب", "تحويل الراتب", "كيف الراتب"]),
+ ("commission", ["عمول", "نسبه", "كوميشن"]),
+ ("hours", ["ساعات", "ساعه", "دوام", "وقت العمل", "اوقات"]),
+ ("terms", ["شروط", "متطلبات", "مطلوب"]),
+ ("salary", ["راتب", "معاش", "اجر", "اجور", "بكم", "تعويض"]),
+]
+_FLBL = {"salary": ("💰", "الراتب"), "payout": ("💳", "استلام الراتب"), "commission": ("🎯", "العمولة"), "hours": ("⏰", "ساعات العمل"), "terms": ("📋", "الشروط")}
+
+def detect_fields(text):
+    nq = " " + norm(text) + " "
+    got = [f for f, ws in _FLD if _has(nq, ws)]
+    if "payout" in got and "salary" in got: got.remove("salary")
+    if not got and _has(nq, ["شكد", "كم"]) and _has(nq, ["راتب", "معاش", "اجر", "شكد"]): got = ["salary"]
+    return got
+
+async def field_answer(update, ctx, flds):
+    act_jobs = [i for i, j in DB["jobs"].items() if j.get("active", True) and job_visible(j)]
+    cj = str(ctx.user_data.get("cj") or "")
+    jid = cj if cj in act_jobs else (act_jobs[0] if len(act_jobs) == 1 else None)
+    if not jid:
+        await show_entry(update.message, "اي وظيفة تقصد؟ اختر 👇"); return True
+    j = DB["jobs"][jid]
+    cs = [(i, c) for i, c in enumerate(j.get("countries", [])) if cc_match(c.get("name", ""), CUR.get())]
+    ctx.user_data["cj"] = jid
+    if not cs:
+        await update.message.reply_text(nojobs_txt(), parse_mode=H, reply_markup=jobs_kb()); return True
+    if len(cs) > 1:
+        await update.message.reply_text("🌍 اي دولة تقصد؟ اختر 👇", reply_markup=job_kb(jid, j)); return True
+    c = cs[0][1]
+    parts = [f"💼 <b>{e(j['title'])}</b> | 🌍 {e(c.get('name', ''))}", ""]
+    for f in flds:
+        ic, lb = _FLBL[f]
+        v = j.get("hours") if f == "hours" else c.get(f)
+        v = (v or "").strip()
+        if v and v != "-": parts.append(f"{ic} <b>{lb}:</b> {e(v)}")
+        else: parts.append(f"{ic} <b>{lb}:</b> غير محدد حالياً، تواصل معنا للتفاصيل 📩")
+    await update.message.reply_text("\n".join(parts), parse_mode=H, reply_markup=country_kb(jid, j), disable_web_page_preview=True)
+    return True
+
 async def answer_question(update, ctx, text):
     a = AI()
     now = time.time()
@@ -1038,6 +1078,12 @@ async def answer_question(update, ctx, text):
     try: await update.message.get_bot().send_chat_action(update.effective_chat.id, "typing")
     except TelegramError: pass
     jid = ctx.user_data.get("cj")
+    flds = detect_fields(text)
+    if flds and not kw_match(text, jid):
+        try:
+            if await field_answer(update, ctx, flds): return
+        except Exception:
+            log.exception("field answer failed")
     if a["on"] and ai_ok and a["keys"]:
         st, d, eng = await ai_converse(text, jid)
         if st == "ok":
