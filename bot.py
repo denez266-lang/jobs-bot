@@ -1059,7 +1059,7 @@ async def field_answer(update, ctx, flds):
     if len(cs) > 1:
         await update.message.reply_text("🌍 اي دولة تقصد؟ اختر 👇", reply_markup=job_kb(jid, j)); return True
     c = cs[0][1]
-    parts = [f"💼 <b>{e(j['title'])}</b> | 🌍 {e(c.get('name', ''))}", ""]
+    parts = []
     for f in flds:
         ic, lb = _FLBL[f]
         v = j.get("hours") if f == "hours" else c.get(f)
